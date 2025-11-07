@@ -5,6 +5,11 @@ import secrets
 import statistics
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Optional
+import logging
+import random
+
+# 添加模块级 logger（修复因未定义 logger 导致的运行错误，并统一日志来源）
+logger = logging.getLogger(__name__)
 
 try:
     from nacl.signing import SigningKey, VerifyKey
@@ -28,12 +33,7 @@ def median_trim(values: List[float], trim_ratio: float = 0.15) -> Optional[float
     k = int(n * trim_ratio)
     values_sorted = sorted(values)
     trimmed = values_sorted[k:n - k] if n - 2 * k >= 1 else values_sorted
-    # 用中位数作为鲁棒聚合
     return statistics.median(trimmed)
-
-def quality_from_delay(delta: float) -> float:
-    # 简化的质量权重，时延越小权重越高
-    return 1.0 / (1.0 + max(delta, 0.0))
 
 # ---- Wire format helpers ----
 
@@ -80,6 +80,9 @@ class PeerNode:
         if HAVE_NACL and self.sk is None:
             self.sk = SigningKey.generate()
             self.vk = self.sk.verify_key
+        # ensure logger has at least basic config in simple runs
+        if not logging.getLogger().handlers:
+            logging.basicConfig(level=logging.INFO)
 
     def network_now(self) -> float:
         # logical network time view
@@ -92,7 +95,9 @@ class PeerNode:
     def datagram_received(self, data, addr):
         try:
             msg = unpack(data)
-        except Exception:
+        except Exception as e:
+            # 记录解析失败的调试信息，便于排查网络消息格式问题
+            logger.debug("Failed to unpack datagram from %s: %s", addr, e)
             return
         mtype = msg.get("type")
         if mtype == "REQ":
@@ -125,6 +130,7 @@ class PeerNode:
         nonce = msg.get("nonce")
         fut = self.pending.get(nonce, (None, None, None))[2]
         if fut is None or fut.done():
+            logger.debug("Received RESP for unknown/finished nonce %s from %s", nonce, addr)
             return
         # signature check
         if HAVE_NACL:
@@ -133,12 +139,21 @@ class PeerNode:
             try:
                 if not vk_hex or not sig_hex:
                     raise ValueError("missing signature")
-                vk = VerifyKey(vk_hex, encoder=HexEncoder)
+                # If we already have a cached key for this peer, prefer it.
+                peer_from = msg.get("from")
+                cached_vk = self.peer_keys.get(peer_from)
+                if cached_vk is not None:
+                    vk = cached_vk
+                else:
+                    # construct VerifyKey from provided vk_hex (validate)
+                    vk = VerifyKey(vk_hex, encoder=HexEncoder)
                 payload = json.dumps({k: msg[k] for k in ("nonce", "from", "t1", "t2")}, separators=(",", ":")).encode()
                 vk.verify(payload, bytes.fromhex(sig_hex))
-                # cache key
-                self.peer_keys[msg["from"]] = vk
-            except Exception:
+                # cache key if not cached
+                if peer_from and peer_from not in self.peer_keys:
+                    self.peer_keys[peer_from] = vk
+            except Exception as e:
+                logger.warning("Signature verification failed for nonce %s from %s: %s", nonce, addr, e)
                 fut.set_exception(ValueError("bad signature"))
                 return
         fut.set_result(msg)
@@ -153,20 +168,26 @@ class PeerNode:
             t0_wall = now_wall()
             t0_mono = now_mono()
             req = {"type": "REQ", "nonce": nonce, "from": self.peer_id, "ts": t0_wall}
-            fut = asyncio.get_event_loop().create_future()
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
             self.pending[nonce] = (t0_wall, t0_mono, fut)
             self.transport.sendto(pack(req), peer)
             try:
                 msg = await asyncio.wait_for(fut, timeout=self.request_timeout)
             except asyncio.TimeoutError:
-                self.pending.pop(nonce, None)
+                logger.debug("Timeout waiting for nonce %s from %s", nonce, peer)
                 continue
-            except Exception:
-                self.pending.pop(nonce, None)
+            except asyncio.CancelledError:
+                logger.debug("Cancelled waiting for nonce %s", nonce)
+                continue
+            except Exception as e:
+                # fut may carry verification exceptions etc.
+                logger.debug("Exception while waiting for nonce %s: %s", nonce, e)
                 continue
             finally:
-                # clean pending entry
+                # clean pending entry (single place)
                 self.pending.pop(nonce, None)
+
             t3_wall = now_wall()
             t3_mono = now_mono()
 
@@ -174,6 +195,7 @@ class PeerNode:
             rtt_wall = t3_wall - t0_wall
             rtt_mono = t3_mono - t0_mono
             if abs(rtt_wall - rtt_mono) > 0.5:  # suspicious local wallclock leap within probe
+                logger.debug("Monotonic/wall mismatch rtt_wall=%.3f rtt_mono=%.3f", rtt_wall, rtt_mono)
                 continue
 
             t1 = msg.get("t1")
@@ -184,6 +206,7 @@ class PeerNode:
 
             # pick the minimal delta sample as representative for this peer
             if delta < 0:
+                logger.debug("Negative delta sample ignored: %.6f", delta)
                 continue  # negative delay indicates bad sample
             if best is None or delta < best[1]:
                 best = (theta, delta)
@@ -193,8 +216,14 @@ class PeerNode:
         # pick peers
         if not self.peers:
             return
-        sample_peers = self.peers if len(self.peers) <= self.per_round_peer_count else \
-            [self.peers[i] for i in sorted(secrets.randbelow(len(self.peers)) for _ in range(self.per_round_peer_count))]
+        if len(self.peers) <= self.per_round_peer_count:
+            sample_peers = self.peers
+        else:
+            sr = random.SystemRandom()
+            # sample without replacement to avoid duplicate probes to the same peer
+            idxs = sr.sample(range(len(self.peers)), self.per_round_peer_count)
+            sample_peers = [self.peers[i] for i in idxs]
+
         tasks = [self.query_peer_once(p) for p in sample_peers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -209,18 +238,33 @@ class PeerNode:
                 delays.append(delta)
 
         if len(offsets) < self.min_samples_for_update:
+            logger.debug("Not enough samples (%d) to update offset", len(offsets))
             return
 
         # delay-based filtering: drop the worst delays (e.g., top 30%)
         if delays:
-            cutoff = statistics.quantiles(delays, n=10)[6]  # ~70th percentile
+            # robust percentile fallback: if too few samples for quantiles, use sorted index
+            try:
+                if len(delays) >= 10:
+                    cutoff = statistics.quantiles(delays, n=10)[6]  # ~70th percentile
+                else:
+                    sorted_delays = sorted(delays)
+                    idx = min(int(len(sorted_delays) * 0.7), len(sorted_delays) - 1)
+                    cutoff = sorted_delays[idx]
+            except Exception as e:
+                logger.debug("Percentile computation error: %s - fallback to max delay", e)
+                cutoff = max(delays)
             good = [(o, d) for o, d in zip(offsets, delays) if d <= cutoff]
             if len(good) >= self.min_samples_for_update:
                 offsets = [o for o, _ in good]
+            else:
+                logger.debug("Filtering would reduce samples below threshold (%d -> %d), skipping filter",
+                             len(offsets), len(good))
 
         # robust aggregate
         theta_star = median_trim(offsets, trim_ratio=self.trim_ratio)
         if theta_star is None:
+            logger.debug("median_trim returned None")
             return
 
         # EMA smoothing
