@@ -1,79 +1,120 @@
 # p2p_time_sync
 
-Peer-to-peer (P2P) time synchronization library and example tools.
+Peer-to-peer 时间同步库与示例工具。
 
-This repository provides a small project for synchronizing clocks across peers in a network without relying on a centralized time server. It demonstrates simple protocols for exchanging timestamps, estimating clock offsets, and applying adjustments to achieve better time alignment between nodes.
+这个仓库演示了如何在对等网络中，在不依赖集中式时间服务器的情况下通过交换时间戳来估计并收敛时钟偏移。示例实现使用 asyncio + UDP，并包含简单的报文签名。
 
-## Features
+## 特性
 
-- Lightweight P2P time synchronization protocol
-- Timestamp exchange and offset estimation
-- Example client and server (or peer) implementations
-- Configurable network and timing parameters
+- 轻量级 P2P 时间同步协议
+- 时间戳交换与偏移估计
+- 示例 peer 节点实现
+- 可选的消息签名/校验
+- 可配置的采样、平滑和延迟过滤参数
 
-## Requirements
+## 要求
 
-- Go 1.20+ (or the language/runtime used in this repo)
-- Git
+- Python 3.8+
+- 可选：PyNaCl
+  - 安装：pip install pynacl
 
-> Note: If this repository uses a different language, update this section accordingly.
+注意：代码使用 asyncio、dataclasses、typing、secrets、statistics 等标准库模块；若不安装 PyNaCl，签名相关功能会自动被跳过（退化到无签名模式）。
 
-## Getting started
+## 安装
 
-1. Clone the repository:
+推荐使用虚拟环境：
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+# 如果需要签名/验证功能：
+pip install pynacl
+
+## 快速开始
+
+1. 克隆仓库：
 
    git clone https://github.com/TYEclipse/p2p_time_sync.git
    cd p2p_time_sync
 
-2. Build (for Go projects):
+2. 运行示例 peer（在不同终端中启动两个或多个 peer）：
 
-   go build ./...
+   # 启动 peer A
+   python3 p2p_time_sync.py --port 8000 --peer 127.0.0.1:8001
 
-3. Run an example peer (adjust commands for the actual project structure):
+   # 启动 peer B
+   python3 p2p_time_sync.py --port 8001 --peer 127.0.0.1:8000
 
-   # start peer A
-   ./peer -port 8000 -peers 127.0.0.1:8001
+默认情况下，节点会周期性地对其已知 peers 发起探测，收集偏移样本并使用 EMA（指数移动平均）来平滑本地的逻辑时钟偏移。
 
-   # start peer B
-   ./peer -port 8001 -peers 127.0.0.1:8000
+如果需要指定监听地址，例如仅监听本机接口：
 
-4. Observe logs to see offset estimation and adjustments.
+python3 p2p_time_sync.py --host 127.0.0.1 --port 8000 --peer 127.0.0.1:8001
 
-## Protocol overview
+## 协议概览
 
-This project implements a simple timestamp exchange protocol:
+交换的报文为 JSON：
 
-1. Peer A sends a "request" message with its local timestamp t1.
-2. Peer B receives the request at t2 (local) and replies with t2 and its reply-send time t3.
-3. Peer A receives the reply at t4 and computes round-trip time (RTT) and clock offset estimates.
+- REQ:
+  {
+    "type": "REQ",
+    "nonce": "<随机字符串>",
+    "from": "<peer_id>",
+    "ts": <t0_client_wall>   # 发送时的本地 wall clock 时间
+  }
 
-Using these values, peers estimate their clock offsets and optionally apply smooth adjustments to converge.
+- RESP:
+  {
+    "type": "RESP",
+    "nonce": "<相同的随机字符串>",
+    "from": "<peer_id>",
+    "t1": <t1_srv_wall>,    # 服务器接收请求时的 wall 时间
+    "t2": <t2_srv_wall>,    # 服务器发送响应时的 wall 时间
+    "sig": "<hex signature>",    # 可选（如果启用 PyNaCl）
+    "vk": "<hex verify key>"     # 可选（发送方的公钥，用于验证 sig）
+  }
 
-## Configuration
+时间估计算法（与 NTP 类似）：
+- 本地发送时间 t0（wall）
+- 远端接收时间 t1（远端 wall）
+- 远端发送时间 t2（远端 wall）
+- 本地接收时间 t3（wall）
 
-Configuration options (examples):
+使用这些值估计时钟偏移 theta 和往返延迟 delta：
+- theta = ((t1 - t0) + (t2 - t3)) / 2
+- delta = (t3 - t0) - (t2 - t1)
 
-- listen port
-- list of peer addresses
-- polling/heartbeat interval
-- smoothing factor for adjustments
+实现中会对同一 peer 做多次采样、选取延迟较小的样本、对 offset 集合做修剪（trim）并用中位数或修剪后的中位数做聚合，然后用 EMA 平滑更新本地逻辑偏移（PeerNode.offset）。
 
-Check the configuration file or flags in the code for exact options.
+消息签名（可选）：
+- 如果安装并可用 PyNaCl，节点会生成一个临时签名密钥（SigningKey）及对应 VerifyKey，并在 RESP 中附带 vk 与 sig。接收方会校验签名以防止伪造响应。
+- 若不希望在每次运行都生成新的密钥，代码可以扩展以从外部保存/加载签名密钥（当前实现为运行时生成并缓存对等方的公钥）。
 
-## Testing
+## 配置选项（在 p2p_time_sync.py 中可调整或扩展）
 
-If there are tests in the repository, run them with:
+- host: 本地监听地址（默认 0.0.0.0）
+- port: 本地监听端口（必需）
+- --peer: 指定对等节点，格式 host:port，可重复，示例：--peer 127.0.0.1:8001
+- samples_per_peer: 每个 peer 的探测次数（默认为 3）
+- per_round_peer_count: 每轮要探测的 peer 数量上限（默认为 20）
+- request_timeout: 单次请求超时时间（秒，默认为 5.0）
+- round_interval: 每轮探测之间的间隔（秒，默认为 60.0）
+- ema_alpha: EMA 平滑系数（默认为 0.3）
+- trim_ratio: 修剪比例用于计算稳健中位数（默认为 0.15）
+- min_samples_for_update: 更新偏移所需的最小样本数（默认为 5）
 
-   go test ./...
+## 运行日志与调试
 
-## Contributing
+- 代码使用标准库 logging；默认在简单运行环境下设置了 basicConfig（INFO 级别）。要查看更多调试信息，请在运行前配置环境变量或在脚本顶部调整 logging 配置，例如：
 
-Contributions are welcome. Please open an issue to discuss major changes or file a pull request with a clear description of your changes.
+python -c "import logging; logging.basicConfig(level=logging.DEBUG)" && python3 p2p_time_sync.py --port 8000 ...
 
-## License
+也可以在代码中直接修改 logging.basicConfig 的级别或格式。
 
-If this project has a license, add it here (e.g., MIT, Apache-2.0). If not, add a LICENSE file to clarify.
+## 贡献
 
-## Contact
+欢迎贡献：修复 bug、完善协议、添加持久化密钥支持、增加发现/引导机制、或者添加更完善的测试与 CI。请先打开 issue 讨论大的设计变更，或直接提交 PR 并在 PR 描述中说明修改内容。
 
-Maintainer: TYEclipse
+## 联系
+
+维护者: TYEclipse
